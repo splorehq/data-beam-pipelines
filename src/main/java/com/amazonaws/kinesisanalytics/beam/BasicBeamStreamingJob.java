@@ -2,70 +2,71 @@ package com.amazonaws.kinesisanalytics.beam;
 
 import org.apache.beam.runners.flink.FlinkRunner;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.aws2.kinesis.KinesisIO;
-import org.apache.beam.sdk.io.aws2.kinesis.KinesisPartitioner;
-import org.apache.beam.sdk.io.aws2.kinesis.KinesisRecord;
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.io.kafka.KafkaIO;
+import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.options.PipelineOptionsValidator;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.commons.lang3.ArrayUtils;
-import org.checkerframework.checker.nullness.qual.NonNull;
+import org.apache.beam.sdk.transforms.Values;
+import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
+import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+import org.apache.beam.sdk.transforms.windowing.Window;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import software.amazon.kinesis.common.InitialPositionInStream;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 
 public class BasicBeamStreamingJob {
     public static final String BEAM_APPLICATION_PROPERTIES = "BeamApplicationProperties";
 
-    private static class PingPongFn extends DoFn<KinesisRecord, byte[]> {
-        private static final Logger LOG = LoggerFactory.getLogger(PingPongFn.class);
+    private static Map<String, Object> getKafkaConsumerProperties() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("security.protocol", "SASL_SSL");
+        properties.put("sasl.mechanism", "AWS_MSK_IAM");
+        properties.put("sasl.jaas.config", "software.amazon.msk.auth.iam.IAMLoginModule required;");
+        properties.put("sasl.client.callback.handler.class", "software.amazon.msk.auth.iam.IAMClientCallbackHandler");
 
-        @ProcessElement
-        public void processElement(ProcessContext c) {
-            String content = new String(c.element().getDataAsBytes(), StandardCharsets.UTF_8);
-            if (content.trim().equalsIgnoreCase("ping")) {
-                LOG.info("Ponged!");
-                c.output("pong\n".getBytes(StandardCharsets.UTF_8));
-            } else {
-                LOG.info("No action for: " + content);
-                c.output(c.element().getDataAsBytes());
-            }
-        }
+        return properties;
     }
 
-    private static final class SimpleHashPartitioner implements KinesisPartitioner<byte[]> {
-        @Override
-        @NonNull public String getPartitionKey(byte[] value) {
-            return String.valueOf(Arrays.hashCode(value));
+    static class LogFn extends DoFn<String, String> {
+        private static final Logger LOG = LoggerFactory.getLogger(LogFn.class);
+
+        @ProcessElement
+        public void processElement(@Element String value, OutputReceiver<String> out) {
+            // Log the value
+            LOG.info("Received value: {}", value);
+            out.output(value);
         }
     }
 
     public static void main(String[] args) {
-        String[] kinesisArgs = BasicBeamStreamingJobOptionsParser.argsFromKinesisApplicationProperties(args, BEAM_APPLICATION_PROPERTIES);
-        BasicBeamStreamingJobOptions options = PipelineOptionsFactory.fromArgs(ArrayUtils.addAll(args, kinesisArgs)).as(BasicBeamStreamingJobOptions.class);
+        PipelineOptions options = PipelineOptionsFactory.create();
         options.setRunner(FlinkRunner.class);
-        options.setShutdownSourcesAfterIdleMs(Long.MAX_VALUE);
+        Pipeline pipeline = Pipeline.create(options);
 
-        PipelineOptionsValidator.validate(BasicBeamStreamingJobOptions.class, options);
-        Pipeline p = Pipeline.create(options);
+        pipeline.apply(KafkaIO.<String, String>read()
+                        .withBootstrapServers("b-2.mskdatastage.3komus.c20.kafka.us-east-1.amazonaws.com:9098,b-1.mskdatastage.3komus.c20.kafka.us-east-1.amazonaws.com:9098")
+                        .withTopic("discord")
+                        .withMaxNumRecords(1000)
+                        .withKeyDeserializer(StringDeserializer.class)
+                        .withValueDeserializer(StringDeserializer.class)
+                        .withConsumerConfigUpdates(getKafkaConsumerProperties()).withoutMetadata())
+                .apply(Values.create())
+                .apply("Log Values", ParDo.of(new LogFn()))
+                .apply("Fixed Window", Window.<String>into(FixedWindows.of(Duration.standardSeconds(60)))
+                        .triggering(AfterProcessingTime.pastFirstElementInPane()
+                                .plusDelayOf(Duration.standardMinutes(1)))
+                        .withAllowedLateness(Duration.standardMinutes(30))
+                        .discardingFiredPanes()
+                )
+                .apply(TextIO.write().to("/tmp/output/flick_").withSuffix(".txt"));
 
-        p.apply("KDS source",
-                        KinesisIO.read()
-                                .withStreamName(options.getInputStreamName())
-                                .withInitialPositionInStream(InitialPositionInStream.LATEST))
-                .apply("Pong transform", ParDo.of(new PingPongFn()))
-                .apply("KDS sink",
-                        KinesisIO.<byte[]>write()
-                                .withStreamName(options.getOutputStreamName())
-                                .withSerializer(r -> r)
-                                // For this to properly balance across shards, the keys would need to be supplied dynamically
-                                .withPartitioner(new SimpleHashPartitioner())
-        );
-
-        p.run().waitUntilFinish();
+        pipeline.run().waitUntilFinish();
     }
 }
+
